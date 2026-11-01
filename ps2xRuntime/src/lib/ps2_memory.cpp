@@ -250,6 +250,7 @@ PS2Memory::~PS2Memory()
     {
         delete[] m_rdram;
         m_rdram = nullptr;
+        m_rdramSize = 0;
     }
 
     if (m_scratchpad)
@@ -306,6 +307,7 @@ bool PS2Memory::initialize(size_t ramSize)
         delete[] m_vu1Code;
         delete[] m_vu1Data;
         m_rdram = nullptr;
+        m_rdramSize = 0;
         m_scratchpad = nullptr;
         ps2SetScratchpadHostPtr(nullptr);
         iop_ram = nullptr;
@@ -337,6 +339,7 @@ bool PS2Memory::initialize(size_t ramSize)
     {
         // Allocate main RAM
         m_rdram = new uint8_t[ramSize];
+        m_rdramSize = ramSize;
         std::memset(m_rdram, 0, ramSize);
 
         // Allocate scratchpad

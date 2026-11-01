@@ -3,8 +3,13 @@
 #include "emulator/core/iop_memory.h"
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
+#include "emulator/imports/iop_ioman.h"
 #include "emulator/imports/iop_loadcore.h"
 #include "emulator/imports/iop_timrman.h"
+#include "emulator/imports/iop_vblank.h"
+#include "emulator/iop_emulator_const.h"
+#include <vector>
+#include <functional>
 #include "emulator/services/iop_rpc.h"
 #include "ps2x/iop/iop_host.h"
 
@@ -76,6 +81,8 @@ namespace
                                       uint32_t,
                                       uint32_t gp) override
         {
+            addresses.push_back(address);
+            if (onCall) onCall();
             ++calls;
             lastAddress = address;
             lastArgument = a0;
@@ -83,6 +90,8 @@ namespace
             return callbackResult;
         }
 
+        std::vector<uint32_t> addresses;
+        std::function<void()> onCall;
         uint32_t callbackResult = 0u;
         uint32_t calls = 0u;
         uint32_t lastAddress = 0u;
@@ -229,6 +238,46 @@ namespace
                expect(cpu.gpr[2] == 2u, "sceCdSC(-1) did not preserve the stream state");
     }
 
+    bool testCdromDevctlInterruptEvent()
+    {
+        NullHost host;
+        IopMemory memory;
+        IopKernel kernel(memory);
+        IopCdvd cdvd(host, memory, kernel);
+        IopIoman ioman(memory, cdvd);
+        RecordingExecutor executor;
+        constexpr uint32_t path = 0x1000u, stack = 0x1100u, output = 0x1200u;
+        const char device[] = "cdrom0:";
+        if (!memory.writeRam(path, device, sizeof(device)))
+            return false;
+        memory.write32(stack + 16u, output);
+        memory.write32(stack + 20u, 4u);
+        IopCpuState cpu{};
+        cpu.gpr[4] = path;
+        cpu.gpr[5] = 0x4391u;
+        cpu.gpr[29] = stack;
+        if (!expect(ioman.dispatchImport(31u, cpu, executor), "cdrom devctl was not handled") ||
+            !expect(cpu.gpr[2] == 0u, "cdrom devctl returned an error"))
+            return false;
+        const uint32_t event = memory.read32(output);
+        IopCpuState sc{};
+        sc.gpr[4] = static_cast<uint32_t>(-11);
+        if (!expect(cdvd.dispatchImport(50u, sc), "sceCdSC(-11) was not handled") ||
+            !expect(event != 0u && event == sc.gpr[2], "devctl did not return the cdvd event flag") ||
+            !pollEvent(kernel, static_cast<int>(event), 0x29u, output + 4u, 0))
+            return false;
+
+        memory.write32(stack + 20u, 3u);
+        cpu.gpr[2] = 0u;
+        if (!expect(ioman.dispatchImport(31u, cpu, executor), "short output was not handled") ||
+            !expect(static_cast<int32_t>(cpu.gpr[2]) == -22, "short output should fail") ||
+            !expect(memory.read32(output) == event, "short output overwrote memory"))
+            return false;
+
+        cpu.gpr[5] = 0x4392u;
+        return expect(!ioman.dispatchImport(31u, cpu, executor), "unknown devctl must remain unhandled");
+    }
+
     bool testCdvdSearchFile()
     {
         const auto suffix = std::to_string(
@@ -262,7 +311,7 @@ namespace
         cpu.gpr[4] = resultAddress;
         cpu.gpr[5] = pathAddress;
         const bool handled = cdvd.dispatchImport(10u, cpu);
-        const bool passed =
+        bool passed =
             expect(handled, "cdvdman:10 was not handled") &&
             expect(cpu.gpr[2] == 1u, "sceCdSearchFile did not find a case-insensitive ISO path") &&
             expect(memory.read32(resultAddress) >= 20u, "sceCdSearchFile returned an invalid LSN") &&
@@ -270,8 +319,97 @@ namespace
             expect(memory.readString(resultAddress + 8u, 16u) == "OPENING.PSS",
                    "sceCdSearchFile returned the wrong file name");
 
+        IopIoman ioman(memory, cdvd);
+        RecordingExecutor executor;
+        cpu = {};
+        cpu.gpr[4] = pathAddress;
+        cpu.gpr[5] = resultAddress;
+        memory.write32(resultAddress + 40u, 0xAABBCCDDu);
+        passed = expect(ioman.dispatchImport(16u, cpu, executor), "cdrom getstat was not handled") &&
+                 expect(cpu.gpr[2] == 0u, "cdrom getstat returned an error") &&
+                 expect(memory.read32(resultAddress) == 0x14u, "cdrom getstat returned the wrong mode") &&
+                 expect(memory.read32(resultAddress + 8u) == 4u, "cdrom getstat returned the wrong size") &&
+                 expect(memory.read32(resultAddress + 40u) == 0xAABBCCDDu, "getstat exceeded the legacy structure") && passed;
+
+        const char missing[] = "cdrom0:\\missing.bin;1";
+        (void)memory.writeRam(pathAddress, missing, sizeof(missing));
+        passed = expect(ioman.dispatchImport(16u, cpu, executor), "missing cdrom file was not handled") &&
+                 expect(static_cast<int32_t>(cpu.gpr[2]) == -2, "missing cdrom file should return ENOENT") && passed;
+
+        (void)memory.writeRam(pathAddress, path, sizeof(path));
+        cpu.gpr[5] = 0u;
+        passed = expect(ioman.dispatchImport(16u, cpu, executor), "invalid getstat output was not handled") &&
+                 expect(static_cast<int32_t>(cpu.gpr[2]) == -22, "invalid getstat output should fail") && passed;
+
+        const char otherDevice[] = "host0:\\opening.pss";
+        (void)memory.writeRam(pathAddress, otherDevice, sizeof(otherDevice));
+        passed = expect(!ioman.dispatchImport(16u, cpu, executor), "other devices must remain unhandled") && passed;
+
         std::filesystem::remove_all(root, error);
         return passed;
+    }
+
+    bool testVblankCallbacks()
+    {
+        IopMemory memory;
+        IopKernel kernel(memory);
+        IopVblank vblank(kernel);
+        RecordingExecutor executor;
+        executor.callbackResult = 1u;
+        const auto registration = [&](unsigned phase, int priority, uint32_t function)
+        {
+            IopCpuState cpu{};
+            cpu.gpr[4] = phase; cpu.gpr[5] = static_cast<uint32_t>(priority);
+            cpu.gpr[6] = function; cpu.gpr[7] = 0x1234u; cpu.gpr[28] = 0x5678u;
+            (void)vblank.dispatchImport(8u, cpu, 0u);
+            return static_cast<int32_t>(cpu.gpr[2]);
+        };
+        const auto release = [&](unsigned phase, uint32_t function)
+        {
+            IopCpuState cpu{};
+            cpu.gpr[4] = phase; cpu.gpr[5] = function;
+            (void)vblank.dispatchImport(9u, cpu, 0u);
+            return static_cast<int32_t>(cpu.gpr[2]);
+        };
+        if (!expect(registration(0u, 20, 0x100u) == 0 && registration(0u, -1, 0x200u) == 0 &&
+                    registration(0u, 20, 0x300u) == 0 && registration(1u, 0, 0x400u) == 0,
+                    "VBlank registration failed") ||
+            !expect(registration(0u, 0, 0x100u) == -104, "duplicate VBlank handler was accepted") ||
+            !expect(release(1u, 0x100u) == -105, "release ignored VBlank phase") ||
+            !expect(vblank.nextEventCycle(UINT64_MAX) == kVblankEndPhaseCycles,
+                    "first VBlank end deadline was lost")) return false;
+        vblank.serviceDue(kVblankEndPhaseCycles - 1u, executor);
+        if (!expect(executor.calls == 0u, "VBlank callback ran early")) return false;
+        vblank.serviceDue(kVblankEndPhaseCycles, executor);
+        if (!expect(executor.addresses == std::vector<uint32_t>{0x400u} &&
+                    executor.lastArgument == 0x1234u && executor.lastGp == 0x5678u,
+                    "VBlank end callback lost its function, argument or GP")) return false;
+        bool contextRejected = false;
+        executor.onCall = [&]
+        {
+            vblank.serviceDue(kVblankPeriodCycles, executor); // Must not recurse.
+            contextRejected = registration(0u, 0, 0x900u) == -100 && release(0u, 0x100u) == -100;
+        };
+        vblank.serviceDue(kVblankPeriodCycles, executor);
+        if (!expect(contextRejected && executor.addresses == std::vector<uint32_t>{0x400u, 0x200u, 0x100u, 0x300u},
+                    "VBlank priority, equal-priority order or interrupt context is wrong")) return false;
+        executor.onCall = {};
+        if (!expect(release(0u, 0x100u) == 0 && release(0u, 0x100u) == -105,
+                    "VBlank release lifecycle failed")) return false;
+        executor.callbackResult = 0u;
+        vblank.serviceDue(4u * kVblankPeriodCycles, executor);
+        const uint32_t calls = executor.calls;
+        vblank.serviceDue(8u * kVblankPeriodCycles, executor);
+        if (!expect(calls == 7u && executor.calls == calls && vblank.nextEventCycle(123u) == 123u,
+                    "VBlank zero-return removal or missed-field coalescing failed")) return false;
+        for (unsigned index = 0; index < 14u; ++index)
+            if (!expect(registration(index % 2u, 0, 0x100u + index * 4u) == 0,
+                        "VBlank handler capacity is too small")) return false;
+        if (!expect(registration(0u, 0, 0x999u) == -400, "VBlank slot exhaustion was not reported")) return false;
+        vblank.reset();
+        vblank.serviceDue(10u * kVblankPeriodCycles, executor);
+        return expect(executor.calls == calls && vblank.nextEventCycle(123u) == 123u &&
+                      registration(0u, 0, 0x100u) == 0, "VBlank reset retained callbacks or slots");
     }
 
     bool testTimrmanPeriodicCallback()
@@ -330,8 +468,8 @@ namespace
 
 int main()
 {
-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback())
+    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdromDevctlInterruptEvent() || !testCdvdSearchFile() ||
+        !testTimrmanPeriodicCallback() || !testVblankCallbacks())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

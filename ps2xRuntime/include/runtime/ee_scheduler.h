@@ -383,6 +383,10 @@ private:
     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
     void applyPendingPreemption();
     void processPendingEvents();
+    void processGsInterrupt();
+    [[nodiscard]] bool gsInterruptAsserted() const noexcept;
+    bool queueIrq(bool dmac, uint32_t cause,
+                  std::function<void(const R5900Context &, R5900Context &)> onComplete = {});
     void processDueDeadlines();
     void processEvent(const EeEvent &event);
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
@@ -425,6 +429,7 @@ private:
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
+    bool m_gsIrqQueued = false;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};

@@ -366,6 +366,47 @@ namespace ps2x::iop::detail
             return interruptEventFlagId;
         }
 
+    public:
+        bool dispatchDevctl(uint32_t command, uint32_t buffer, uint32_t bufferSize, int32_t &result)
+        {
+            if (command != 0x4391u)
+                return false;
+
+            uint32_t existing = 0u;
+            if (buffer == 0u || bufferSize < sizeof(existing) ||
+                !memory.readRam(buffer, &existing, sizeof(existing)))
+            {
+                result = -22; // EINVAL
+                return true;
+            }
+            const int eventId = ensureInterruptEventFlag();
+            if (eventId <= 0)
+            {
+                result = eventId;
+                return true;
+            }
+            const uint32_t output = static_cast<uint32_t>(eventId);
+            result = memory.writeRam(buffer, &output, sizeof(output)) ? 0 : -22;
+            return true;
+        }
+
+        int32_t statLegacyFile(uint32_t nameAddress, uint32_t resultAddress)
+        {
+            if (nameAddress == 0u || resultAddress == 0u)
+                return -22;
+            IsoNode *node = findVirtualIsoNode(memory.readString(nameAddress, 1024u));
+            if (!node)
+                return -2; // ENOENT
+            // Legacy io_stat_t has a 40-byte layout. Virtual ISO timestamps
+            // are not currently modeled, matching sceCdSearchFile's result.
+            std::array<uint8_t, 40> stat{};
+            writeLe32(stat.data(), node->directory ? 0x25u : 0x14u);
+            writeLe32(stat.data() + 8u, node->size);
+            return memory.writeRam(resultAddress, stat.data(), stat.size()) ? 0 : -22;
+        }
+
+    private:
+
         void signalCommandComplete()
         {
             if (interruptEventFlagId != 0)
@@ -742,6 +783,16 @@ namespace ps2x::iop::detail
     bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
     {
         return m_impl->dispatchImport(ordinal, cpu);
+    }
+
+    bool IopCdvd::dispatchDevctl(uint32_t command, uint32_t buffer, uint32_t bufferSize, int32_t &result)
+    {
+        return m_impl->dispatchDevctl(command, buffer, bufferSize, result);
+    }
+
+    int32_t IopCdvd::statLegacyFile(uint32_t nameAddress, uint32_t resultAddress)
+    {
+        return m_impl->statLegacyFile(nameAddress, resultAddress);
     }
 
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept

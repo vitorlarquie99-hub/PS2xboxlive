@@ -181,6 +181,8 @@ namespace ps2recomp
         bool singleFileOutput = false;
         bool lowMemoryMode = false;
         uint32_t outputWorkerThreads = 0;
+        std::vector<uint32_t> liveImmediateAddresses;
+        std::vector<uint32_t> recompileAddresses;
         bool patchSyscalls = false;
         bool patchCop0 = true;
         bool patchCache = true;

@@ -9,11 +9,12 @@ namespace ps2x::iop::detail
     struct IopCpuState;
     class IopGuestExecutor;
     class IopMemory;
+    class IopCdvd;
 
     class IopIoman
     {
     public:
-        explicit IopIoman(IopMemory &memory) noexcept;
+        IopIoman(IopMemory &memory, IopCdvd &cdvd) noexcept;
 
         void reset();
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
@@ -27,6 +28,7 @@ namespace ps2x::iop::detail
         };
 
         IopMemory &m_memory;
+        IopCdvd &m_cdvd;
         std::vector<Device> m_devices;
     };
 }

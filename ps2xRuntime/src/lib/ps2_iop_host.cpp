@@ -530,3 +530,25 @@ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
     }
     std::cerr << prefix << ' ' << message << std::endl;
 }
+
+
+bool PS2IopHostAdapter::readControllerButtons(unsigned port, uint16_t &buttons)
+{
+    buttons = 0xFFFFu;
+    if (port != 0u) return false;
+    uint8_t data[32]{};
+    if (!m_runtime.padBackend().readState(0, 0, data, sizeof(data))) return false;
+    buttons = static_cast<uint16_t>(data[2] | (static_cast<uint16_t>(data[3]) << 8u));
+    return true;
+}
+
+
+bool PS2IopHostAdapter::readControllerAxes(unsigned port, std::array<uint8_t, 4> &axes)
+{
+    axes.fill(0x80u);
+    if (port != 0u) return false;
+    uint8_t data[32]{};
+    if (!m_runtime.padBackend().readState(0, 0, data, sizeof(data))) return false;
+    std::copy_n(data + 4, 4, axes.begin());
+    return true;
+}

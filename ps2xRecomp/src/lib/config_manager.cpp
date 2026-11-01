@@ -61,7 +61,25 @@ namespace ps2recomp
                 }
             }
             config.outputWorkerThreads = static_cast<uint32_t>(clampedOutputWorkers);
+            if (general.contains("live_immediate_addresses"))
+            {
+                for (const auto address : toml::find<std::vector<int64_t>>(general, "live_immediate_addresses"))
+                {
+                    if (address < 0 || address > std::numeric_limits<uint32_t>::max() || (address & 3) != 0)
+                        throw std::runtime_error("live_immediate_addresses requires aligned 32-bit addresses");
+                    config.liveImmediateAddresses.push_back(static_cast<uint32_t>(address));
+                }
+            }
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
+            if (general.contains("recompile_addresses"))
+            {
+                for (const auto address : toml::find<std::vector<int64_t>>(general, "recompile_addresses"))
+                {
+                    if (address < 0 || address > std::numeric_limits<uint32_t>::max() || (address & 3) != 0)
+                        throw std::runtime_error("recompile_addresses requires aligned 32-bit addresses");
+                    config.recompileAddresses.push_back(static_cast<uint32_t>(address));
+                }
+            }
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
 
@@ -292,6 +310,8 @@ namespace ps2recomp
         general["single_file_output"] = config.singleFileOutput;
         general["low_memory_mode"] = config.lowMemoryMode;
         general["output_worker_threads"] = static_cast<int64_t>(config.outputWorkerThreads);
+        general["live_immediate_addresses"] = config.liveImmediateAddresses;
+        general["recompile_addresses"] = config.recompileAddresses;
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;

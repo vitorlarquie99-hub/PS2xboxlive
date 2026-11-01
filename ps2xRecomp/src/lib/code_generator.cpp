@@ -275,6 +275,11 @@ namespace ps2recomp
         const std::vector<Instruction> &instructions,
         const bool &useHeaders)
     {
+        for (const auto &inst : instructions)
+            if (m_liveImmediateAddresses.contains(inst.address) &&
+                inst.opcode != OPCODE_LUI && inst.opcode != OPCODE_ADDIU && inst.opcode != OPCODE_LW &&
+                inst.opcode != OPCODE_SW && inst.opcode != OPCODE_J && inst.opcode != OPCODE_JAL)
+                throw std::runtime_error("unsupported live relocation instruction");
         FunctionEmitter emitter(*this);
         return emitter.emit(function, instructions, useHeaders);
     }

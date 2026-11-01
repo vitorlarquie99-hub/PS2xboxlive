@@ -1,15 +1,18 @@
 #include "iop_ioman.h"
+#include "iop_cdvd.h"
 
 #include "../core/iop_cpu.h"
 #include "../core/iop_memory.h"
 #include "../services/iop_rpc.h"
+#include "ps2x/iop/ps2_path.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace ps2x::iop::detail
 {
-    IopIoman::IopIoman(IopMemory &memory) noexcept
-        : m_memory(memory)
+    IopIoman::IopIoman(IopMemory &memory, IopCdvd &cdvd) noexcept
+        : m_memory(memory), m_cdvd(cdvd)
     {
     }
 
@@ -29,6 +32,26 @@ namespace ps2x::iop::detail
 
         switch (ordinal)
         {
+        case 16: // Legacy ioman getstat for the CD-ROM device.
+            if (parsePs2Path(m_memory.readString(a0, 1024u)).device != Ps2PathDevice::Cdrom)
+                return false;
+            setV0(static_cast<uint32_t>(m_cdvd.statLegacyFile(a0, cpu.gpr[5])));
+            return true;
+        case 31: // ioman 1.4 devctl; arguments five and six are on the IOP stack.
+        {
+            if (parsePs2Path(m_memory.readString(a0, 128u)).device != Ps2PathDevice::Cdrom)
+                return false;
+            const uint32_t stack = cpu.gpr[29];
+            uint32_t arguments[2]{};
+            if (stack > std::numeric_limits<uint32_t>::max() - 16u ||
+                !m_memory.readRam(stack + 16u, arguments, sizeof(arguments)))
+                return false;
+            int32_t result = 0;
+            if (!m_cdvd.dispatchDevctl(cpu.gpr[5], arguments[0], arguments[1], result))
+                return false;
+            setV0(static_cast<uint32_t>(result));
+            return true;
+        }
         case 20: // AddDrv
         {
             if (a0 == 0u || m_devices.size() >= kMaxDevices)

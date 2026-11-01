@@ -31,6 +31,7 @@ namespace
         {
             ps2_stubs::resetSifState();
             std::memset(&ctx, 0, sizeof(ctx));
+            runtime.eeScheduler().reset(rdram.data(), ctx);
         }
     };
 

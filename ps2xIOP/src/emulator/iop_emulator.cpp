@@ -91,6 +91,7 @@ namespace ps2x::iop::detail
             uint32_t function = 0u;
             uint32_t gp = 0u;
             uint32_t argument = 0u;
+            bool requiresInterrupts = false;
         };
 
         explicit Impl(IopHost &hostRef)
@@ -105,11 +106,15 @@ namespace ps2x::iop::detail
               heaplib(memory),
               intrman(memory),
               timrman(),
-              ioman(memory),
+              ioman(memory, cdvd),
               cpuCore(memory),
               imports(memory),
               loadcore(memory, imports)
         {
+            memory.setControllerAxesReader([this](unsigned port, std::array<uint8_t, 4> &axes)
+            { return host.readControllerAxes(port, axes); });
+            memory.setControllerReader([this](unsigned port, uint16_t &buttons)
+            { return host.readControllerButtons(port, buttons); });
             reset();
         }
 
@@ -123,6 +128,7 @@ namespace ps2x::iop::detail
             cdvd.reset();
             intrman.reset();
             timrman.reset();
+            vblank.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
@@ -133,6 +139,7 @@ namespace ps2x::iop::detail
             eeCycleCarry = 0;
             activeCpu = nullptr;
             lastError.clear();
+            servicingSio2Interrupt = false;
             servicingDmaInterrupts = false;
             servicingGuestCallbacks = false;
             callDepth = 0u;
@@ -318,9 +325,15 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
-                return rpc.dispatchSifManImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                const uint32_t callback = cpu.gpr[6];
+                const uint32_t argument = cpu.gpr[7];
+                const uint32_t gp = cpu.gpr[28];
+                if (!rpc.dispatchSifManImport(call.ordinal, cpu))
+                    return ImportDisposition::Missing;
+                if (call.ordinal == 32u && cpu.gpr[2] != 0u && callback != 0u)
+                    pendingGuestCallbacks.emplace(totalCycles + 1u,
+                                                  ScheduledGuestCallback{callback, gp, argument, true});
+                return ImportDisposition::Handled;
             }
             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
@@ -406,10 +419,13 @@ namespace ps2x::iop::detail
             {
                 if (!step(cpu))
                     break;
+                serviceSio2Interrupt();
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                     servicePendingDmaInterrupts();
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
                     servicePendingGuestCallbacks();
+                if (memory.interruptControl() != 0u && vblank.nextEventCycle(UINT64_MAX) <= totalCycles)
+                    vblank.serviceDue(totalCycles, *this);
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
@@ -481,6 +497,22 @@ namespace ps2x::iop::detail
         }
 
         // Not that good to use exception handling for control flow but will do for now
+        void serviceSio2Interrupt()
+        {
+            constexpr uint32_t mask = 1u << 17u;
+            if (servicingSio2Interrupt || memory.interruptControl() == 0u ||
+                (memory.interruptStatus() & memory.interruptMask() & mask) == 0u ||
+                (memory.read32(0x1F808280u) & 1u) == 0u)
+                return;
+            servicingSio2Interrupt = true;
+            struct Guard { bool &flag; ~Guard() { flag = false; } } guard{servicingSio2Interrupt};
+            // A handler may acknowledge and start another transfer. Consume
+            // this edge before invoking it so that the new edge survives.
+            memory.setInterruptStatus(memory.interruptStatus() & ~mask);
+            if (!intrman.dispatchInterrupt(17, *this))
+                memory.setInterruptStatus(memory.interruptStatus() | mask);
+        }
+
         void servicePendingDmaInterrupts()
         {
             if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
@@ -522,6 +554,11 @@ namespace ps2x::iop::detail
             {
                 if (it->first > totalCycles)
                     break;
+                if (it->second.requiresInterrupts && memory.interruptControl() == 0u)
+                {
+                    ++it;
+                    continue;
+                }
                 callbacks.push_back(it->second);
                 it = pendingGuestCallbacks.erase(it);
             }
@@ -533,6 +570,11 @@ namespace ps2x::iop::detail
             {
                 for (const ScheduledGuestCallback &callback : callbacks)
                 {
+                    if (callback.requiresInterrupts && memory.interruptControl() == 0u)
+                    {
+                        pendingGuestCallbacks.emplace(totalCycles, callback);
+                        continue;
+                    }
                     if (callback.function != 0u)
                     {
                         (void)callFunction(callback.function,
@@ -560,18 +602,27 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    serviceSio2Interrupt();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
+                    if (memory.interruptControl() != 0u)
+                        vblank.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
                         uint64_t nextWake = kernel.nextWakeCycle(target);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
-                        if (!pendingGuestCallbacks.empty())
-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                        for (const auto &[cycle, callback] : pendingGuestCallbacks)
+                            if (!callback.requiresInterrupts || memory.interruptControl() != 0u)
+                            {
+                                nextWake = std::min(nextWake, cycle);
+                                break;
+                            }
                         nextWake = timrman.nextEventCycle(nextWake);
+                        if (memory.interruptControl() != 0u)
+                            nextWake = vblank.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -671,6 +722,7 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            memory.releaseModule(it->second.base);
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)
@@ -704,6 +756,7 @@ namespace ps2x::iop::detail
         uint64_t eeCycleCarry = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
+        bool servicingSio2Interrupt = false;
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;

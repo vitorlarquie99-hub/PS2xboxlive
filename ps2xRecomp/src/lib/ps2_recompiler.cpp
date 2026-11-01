@@ -999,6 +999,8 @@ namespace ps2recomp
 
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
+            m_codeGenerator->m_liveImmediateAddresses.insert(m_config.liveImmediateAddresses.begin(), m_config.liveImmediateAddresses.end());
+            m_codeGenerator->m_recompileAddresses.insert(m_config.recompileAddresses.begin(), m_config.recompileAddresses.end());
             m_codeGenerator->setReporter(&m_reporter);
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
@@ -2221,6 +2223,13 @@ namespace ps2recomp
 
     bool PS2Recompiler::isStubFunction(const Function &function) const
     {
+        // Some SDK handlers only approximate guest behavior. Allow a game
+        // configuration to retain the original implementation at selected starts.
+        if (std::find(m_config.recompileAddresses.begin(), m_config.recompileAddresses.end(),
+                      function.start) != m_config.recompileAddresses.end())
+        {
+            return false;
+        }
         if (m_stubFunctionStarts.contains(function.start))
         {
             return true;

@@ -274,6 +274,7 @@ public:
 
     // Memory access methods
     uint8_t *getRDRAM() { return m_rdram; }
+    size_t getRDRAMSize() const { return m_rdramSize; }
     uint8_t *getScratchpad() { return m_scratchpad; }
     uint8_t *getIOPRAM() { return iop_ram; }
     uint64_t dmaStartCount() const { return m_dmaStartCount.load(std::memory_order_relaxed); }
@@ -362,6 +363,7 @@ public:
     bool hasSeenGifCopy() const { return m_seenGifCopy; }
     // Main RAM (32MB)
     uint8_t *m_rdram;
+    size_t m_rdramSize = 0;
 
     // Scratchpad memory (16KB)
     uint8_t *m_scratchpad;

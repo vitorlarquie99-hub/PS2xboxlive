@@ -6,6 +6,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_missing_capture.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -1193,6 +1195,33 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 {
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
+
+    if (firstReport)
+    {
+        const char *directory = std::getenv("PS2X_CAPTURE_MISSING_DIR");
+        if (directory && directory[0] != '\0')
+        {
+            try
+            {
+                if (rdram && rdram == m_memory.getRDRAM())
+                {
+                    std::string error;
+                    if (ps2_debug::captureMissingTarget(directory,
+                            std::span<const uint8_t>(rdram, m_memory.getRDRAMSize()),
+                            sourcePc, targetPc, error))
+                        std::cerr << "[guest-capture] saved to " << directory << std::endl;
+                    else
+                        std::cerr << "[guest-capture] " << error << std::endl;
+                }
+                else
+                    std::cerr << "[guest-capture] guest memory is unavailable" << std::endl;
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "[guest-capture] " << error.what() << std::endl;
+            }
+        }
+    }
 
     const uint32_t pc = ctx->pc;
     const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));

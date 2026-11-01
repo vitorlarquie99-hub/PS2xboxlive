@@ -72,6 +72,10 @@ namespace
     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
+    constexpr uint32_t kGsIrqEntryPc = 0x00160600u;
+    constexpr uint32_t kGsIrqHandlerPc = 0x00160610u;
+    constexpr uint32_t kGsIrqHandlerResumePc = 0x00160620u;
+    constexpr uint32_t kGsIrqStepPc = 0x00160630u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -97,6 +101,62 @@ namespace
     uint32_t g_invocationQueueRuns = 0u;
     uint32_t g_invocationQueueSp = 0u;
     bool g_invocationQueueSpChanged = false;
+    uint32_t g_gsIrqRuns = 0u;
+    uint32_t g_gsIrqStep = 0u;
+    bool g_gsIrqOrderingOk = true;
+
+    void schedulerGsIrqEntry(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->eeScheduler().addIrqHandler(false, 0u, kGsIrqHandlerPc, true, 0u, 0u, 0u);
+        runtime->memory().write64(0x12001010u, 0x1f00u);
+        runtime->gs().writeRegister(GS_REG_FINISH, 0u);
+        ctx->pc = kGsIrqStepPc;
+    }
+
+    void schedulerGsIrqHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ++g_gsIrqRuns;
+        g_gsIrqOrderingOk &= getRegU32(ctx, 4) == 0u;
+        // Yield once with CSR still asserted: only one IRQ chain may be queued.
+        ctx->pc = kGsIrqHandlerResumePc;
+    }
+
+    void schedulerGsIrqHandlerResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->memory().write32(0x12001000u, 3u);
+        ctx->pc = 0u;
+    }
+
+    void schedulerGsIrqStep(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        switch (g_gsIrqStep++)
+        {
+        case 0:
+            g_gsIrqOrderingOk &= g_gsIrqRuns == 0u;
+            // Unmask a previously asserted FINISH through a 32-bit IMR write.
+            runtime->memory().write32(0x12001010u, 0x1d00u);
+            break;
+        case 1:
+            g_gsIrqOrderingOk &= g_gsIrqRuns == 1u;
+            runtime->gs().writeRegister(GS_REG_FINISH, 0u);
+            break;
+        case 2:
+            g_gsIrqOrderingOk &= g_gsIrqRuns == 2u;
+            runtime->memory().write64(0x12001010u, 0u);
+            runtime->eeScheduler().setIrqCauseEnabled(false, 0u, false);
+            runtime->gs().writeRegister(GS_REG_SIGNAL, 0u);
+            break;
+        case 3:
+            g_gsIrqOrderingOk &= g_gsIrqRuns == 2u;
+            runtime->eeScheduler().setIrqCauseEnabled(false, 0u, true);
+            break;
+        default:
+            g_gsIrqOrderingOk &= g_gsIrqRuns == 3u;
+            runtime->requestStop();
+            break;
+        }
+        ctx->pc = kGsIrqStepPc;
+    }
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -523,6 +583,29 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(g_resumedResult, 0, "the first VBlank field should return even-field parity");
             t.Equals(g_vsyncCsr & 0x2000ull, 0x2000ull,
                      "the first VBlank should publish GS CSR.FIELD before resuming guest code");
+        });
+
+        tc.Run("GS FINISH and SIGNAL dispatch masked acknowledged and rearmed INTC_GS callbacks", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.gs().init(env.runtime.memory().getGSVRAM(),
+                                  static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &env.runtime.memory().gs());
+            env.runtime.registerFunction(kGsIrqEntryPc, schedulerGsIrqEntry);
+            env.runtime.registerFunction(kGsIrqHandlerPc, schedulerGsIrqHandler);
+            env.runtime.registerFunction(kGsIrqHandlerResumePc, schedulerGsIrqHandlerResume);
+            env.runtime.registerFunction(kGsIrqStepPc, schedulerGsIrqStep);
+            g_gsIrqRuns = 0u;
+            g_gsIrqStep = 0u;
+            g_gsIrqOrderingOk = true;
+            R5900Context mainContext{};
+            mainContext.pc = kGsIrqEntryPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+            t.IsTrue(g_gsIrqOrderingOk, "GS IRQ must respect IMR and INTC masks and complete before base execution");
+            t.Equals(g_gsIrqRuns, 3u, "one callback per acknowledged FINISH or SIGNAL, without queued duplicates");
+            t.Equals(env.runtime.memory().gs().csr.load() & 3ull, 0ull,
+                     "guest acknowledgement should clear the delivered status bits");
         });
 
         tc.Run("VBlank IRQ invocation completes before the resumed base context", [](TestCase &t)

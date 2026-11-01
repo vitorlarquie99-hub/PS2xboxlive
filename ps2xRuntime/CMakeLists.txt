@@ -16,6 +16,7 @@ option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" O
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
 option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
+set(PS2X_RUNNER_GENERATED_DIR "" CACHE PATH "Directory containing generated runner sources and headers")
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -385,6 +386,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
+    src/lib/ps2_missing_capture.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
@@ -437,9 +439,23 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+if(PS2X_RUNNER_GENERATED_DIR)
+    get_filename_component(PS2X_RUNNER_GENERATED_DIR_ABSOLUTE
+        "${PS2X_RUNNER_GENERATED_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    foreach(PS2X_REQUIRED_GENERATED_FILE IN ITEMS
+        register_functions.cpp ps2_recompiled_functions.h ps2_recompiled_stubs.h)
+        if(NOT EXISTS "${PS2X_RUNNER_GENERATED_DIR_ABSOLUTE}/${PS2X_REQUIRED_GENERATED_FILE}")
+            message(FATAL_ERROR "Missing generated runner file: ${PS2X_RUNNER_GENERATED_DIR_ABSOLUTE}/${PS2X_REQUIRED_GENERATED_FILE}")
+        endif()
+    endforeach()
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+        "${PS2X_RUNNER_GENERATED_DIR_ABSOLUTE}/*.cpp")
+    set(PS2X_RUNNER_GENERATED_INCLUDE_DIR "${PS2X_RUNNER_GENERATED_DIR_ABSOLUTE}")
+else()
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp")
+    set(PS2X_RUNNER_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+endif()
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
@@ -469,6 +485,12 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
+# Runtime memory helpers and generated VU/MMI code use SSE4.1 intrinsics.
+# Propagate the requirement to consumers compiling the public runtime headers.
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$")
+    target_compile_options(ps2_runtime PUBLIC -msse4.1)
+endif()
+
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
@@ -476,8 +498,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_RUNNER_GENERATED_INCLUDE_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_RUNNER_GENERATED_INCLUDE_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -489,6 +511,10 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
+endif()
+
+if(PS2X_RUNNER_GENERATED_DIR)
+    target_include_directories(ps2EntryRunner BEFORE PRIVATE "${PS2X_RUNNER_GENERATED_INCLUDE_DIR}")
 endif()
 
 if(PS2X_DEFAULT_BOOT_ELF_DEFINE)

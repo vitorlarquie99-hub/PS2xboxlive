@@ -1,5 +1,8 @@
 #pragma once
 
+#include <array>
+#include <deque>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -22,13 +25,14 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        static constexpr uint32_t HeapBase = 0x00010000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
         {
             uint32_t address = 0;
             uint32_t size = 0;
+            bool module = false;
         };
 
         struct DmaStart
@@ -40,6 +44,8 @@ namespace ps2x::iop::detail
         IopMemory();
 
         void reset();
+        void setControllerAxesReader(std::function<bool(unsigned, std::array<uint8_t, 4> &)> reader) { m_controllerAxesReader = std::move(reader); }
+        void setControllerReader(std::function<bool(unsigned, uint16_t &)> reader) { m_controllerReader = std::move(reader); }
 
         [[nodiscard]] uint8_t read8(uint32_t address) const;
         [[nodiscard]] uint16_t read16(uint32_t address) const;
@@ -56,6 +62,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
 
         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
+        [[nodiscard]] bool reserveModule(uint32_t address, uint32_t size);
+        void releaseModule(uint32_t address);
+        [[nodiscard]] uint32_t totalFreeMemory() const;
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
@@ -75,6 +84,15 @@ namespace ps2x::iop::detail
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
+        void writeSio2Byte(uint8_t value);
+        std::function<bool(unsigned, uint16_t &)> m_controllerReader;
+        mutable std::deque<uint8_t> m_sio2Output;
+        std::vector<uint8_t> m_sio2Input;
+        unsigned m_sio2Command = 0u;
+        std::array<bool, 2> m_sio2Config{};
+        std::array<uint8_t, 2> m_sio2Mode{0x41u, 0x41u};
+        std::array<std::array<uint8_t, 6>, 2> m_sio2MotorMap{};
+        std::function<bool(unsigned, std::array<uint8_t, 4> &)> m_controllerAxesReader;
         void markOwned(uint32_t address, size_t size);
 
         std::vector<uint8_t> m_ram;
@@ -82,7 +100,7 @@ namespace ps2x::iop::detail
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
-        uint32_t m_heapCursor = HeapBase;
+
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

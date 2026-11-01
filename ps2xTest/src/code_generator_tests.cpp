@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "ps2recomp/code_generator.h"
+#include "ps2recomp/config_manager.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
 #include "ps2recomp/types.h"
@@ -168,6 +169,134 @@ void register_code_generator_tests()
 {
     MiniTest::Case("CodeGenerator", [](TestCase &tc)
                    {
+    tc.Run("Guest recompilation addresses round trip and reject invalid values", [](TestCase &t) {
+        const auto path = std::filesystem::temp_directory_path() / "ps2recomp-guest-address-test.toml";
+        ConfigManager manager(path.string());
+        RecompilerConfig config{};
+        config.inputPath = "input.elf";
+        config.outputPath = "output";
+        config.recompileAddresses = {0x1000u, 0xFFFFFFFCu};
+        manager.saveConfig(config);
+        t.IsTrue(manager.loadConfig().recompileAddresses == config.recompileAddresses,
+                 "Guest function starts must survive save and load");
+        for (const auto &value : {"-4", "0x1001", "0x100000000", "true"})
+        {
+            {
+                std::ofstream file(path);
+                file << "[general]\ninput = \"input.elf\"\noutput = \"output\"\nrecompile_addresses = [" << value << "]\n";
+            }
+            bool rejected = false;
+            try { (void)manager.loadConfig(); }
+            catch (const std::exception &) { rejected = true; }
+            t.IsTrue(rejected, std::string("Invalid guest address must fail: ") + value);
+        }
+        {
+            std::ofstream file(path);
+            file << "[general]\ninput = \"input.elf\"\noutput = \"output\"\n";
+        }
+        t.IsTrue(manager.loadConfig().recompileAddresses.empty(), "Default stub selection stays enabled");
+        std::filesystem::remove(path);
+    });
+    tc.Run("Live immediate configuration round trips and rejects invalid addresses", [](TestCase &t) {
+        const auto path = std::filesystem::temp_directory_path() / "ps2recomp-live-immediate-test.toml";
+        ConfigManager manager(path.string());
+        RecompilerConfig config{};
+        config.inputPath = "input.elf";
+        config.outputPath = "output";
+        config.liveImmediateAddresses = {0x1000u, 0x1004u};
+        manager.saveConfig(config);
+        t.IsTrue(manager.loadConfig().liveImmediateAddresses == config.liveImmediateAddresses,
+                 "Configured addresses must survive save and load");
+        for (const auto &value : {"-1", "0x1001", "0x100000000", "true"})
+        {
+            {
+                std::ofstream file(path);
+                file << "[general]\ninput = \"input.elf\"\noutput = \"output\"\nlive_immediate_addresses = [" << value << "]\n";
+            }
+            bool rejected = false;
+            try { (void)manager.loadConfig(); }
+            catch (const std::exception &) { rejected = true; }
+            t.IsTrue(rejected, std::string("Invalid address must fail: ") + value);
+        }
+        {
+            std::ofstream file(path);
+            file << "[general]\ninput = \"input.elf\"\noutput = \"output\"\n";
+        }
+        t.IsTrue(manager.loadConfig().liveImmediateAddresses.empty(), "Option is disabled by default");
+        std::filesystem::remove(path);
+    });
+    tc.Run("Live relocation immediates use RAM and disable stale memory hints", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        gen.m_liveImmediateAddresses = {0x1000u, 0x1004u};
+        const auto high = gen.translateInstruction(makeLui(0x1000, 2, 0x1b));
+        const auto low = gen.translateInstruction(makeIType(0x1004, OPCODE_ADDIU, 2, 2, 0x8000));
+        t.IsTrue(high.find("READ32(0x1000u)") != std::string::npos, "LUI must read live instruction");
+        t.IsTrue(low.find("(int32_t)(int16_t)") != std::string::npos, "ADDIU sign extends low immediate");
+        MemoryAccessHint hint{};
+        hint.hasAddress = true;
+        hint.address = 0x1b7b6c;
+        const auto load = gen.translateInstruction(makeIType(0x1008, OPCODE_LW, 2, 17, 12), hint);
+        t.IsTrue(load.find("1B7B6C") == std::string::npos, "Derived constant address must be discarded");
+        t.IsTrue(load.find("GPR_U32(ctx, 2)") != std::string::npos, "Load must use runtime register");
+        CodeGenerator baseline({}, {});
+        const auto normal = baseline.translateInstruction(makeIType(0x1008, OPCODE_LW, 2, 17, 12), hint);
+        t.IsTrue(normal.find("FAST_READ32(0x1B7B6Cu)") != std::string::npos, "Default behavior preserved");
+    });
+    tc.Run("Live LW reads signed displacement from RAM and sign extends loaded word", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        gen.m_liveImmediateAddresses = {0x2000u};
+        MemoryAccessHint stale{};
+        stale.hasAddress = true;
+        stale.address = 0x12345678;
+        const auto code = gen.translateInstruction(makeLw(0x2000, 3, 2, 0x7b60), stale);
+        t.IsTrue(code.find("READ32(0x2000u)") != std::string::npos, "Offset must come from live instruction");
+        t.IsTrue(code.find("(int32_t)(int16_t)") != std::string::npos, "Offset must be signed");
+        t.IsTrue(code.find("SET_GPR_S32(ctx, 3, (int32_t)READ32(ADD32(GPR_U32(ctx, 2)") != std::string::npos,
+                 "Load must use runtime base and sign extend its result");
+        t.IsTrue(code.find("12345678") == std::string::npos, "Stale memory hint must not override live offset");
+    });
+    tc.Run("Live relocation rejects unsupported conditional branches", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        gen.m_liveImmediateAddresses = {0x1000u};
+        auto inst = makeBranch(0x1000, 1);
+        Function fn{}; fn.name = "bad_live_jump"; fn.start = 0x1000; fn.end = 0x1004;
+        bool rejected = false;
+        try { (void)gen.generateFunction(fn, {inst}, false); }
+        catch (const std::runtime_error &) { rejected = true; }
+        t.IsTrue(rejected, "Unsupported control flow must fail explicitly");
+    });
+    tc.Run("Live stores use signed patched displacements", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        gen.m_liveImmediateAddresses = {0x1000u};
+        const auto code = gen.translateInstruction(makeSw(0x1000, 3, 2, 0x1234));
+        t.IsTrue(code.find("WRITE32(ADD32(GPR_U32(ctx, 2), (int32_t)(int16_t)(READ32(0x1000u)") != std::string::npos,
+                 "SW must use the live signed offset and runtime base");
+        t.IsTrue(code.find("GPR_U32(ctx, 3)") != std::string::npos, "SW stores the source word");
+    });
+    tc.Run("Live jumps capture patched targets before delay slots and bypass static handlers", [](TestCase &t) {
+        for (uint32_t opcode : {uint32_t(OPCODE_J), uint32_t(OPCODE_JAL)})
+        {
+            CodeGenerator gen({}, {});
+            gen.m_liveImmediateAddresses = {0x8FFFFFFCu};
+            gen.m_relocationCallNames[0x8FFFFFFCu] = "ret0";
+            Function fn{}; fn.name = "live_jump"; fn.start = 0x8FFFFFFCu; fn.end = 0x90000004u;
+            auto jump = makeJal(fn.start, 0x90001000u);
+            jump.opcode = opcode;
+            jump.raw = (opcode << 26) | jump.target;
+            const auto code = gen.generateFunction(fn, {jump, makeAddiu(0x90000000u, 4, 31, 0)}, false);
+            const auto target = code.find("const uint32_t jumpTarget = 0x90000000u | ((READ32(0x8FFFFFFCu) & 0x03FFFFFFu) << 2)");
+            const auto delay = code.find("ADD32(GPR_U32(ctx, 31)");
+            t.IsTrue(target != std::string::npos && delay != std::string::npos && target < delay,
+                     "PC+4 supplies the high nibble and target is captured before executing the delay slot");
+            t.IsTrue(code.find("ps2_stubs::ret0") == std::string::npos,
+                     "Captured import name must not replace a live target");
+            t.IsTrue(code.find(opcode == OPCODE_JAL ? "GuestBranchKind::DirectCall" : "GuestBranchKind::DirectJump") != std::string::npos,
+                     "Dispatch must retain call versus jump semantics");
+            const auto link = code.find("SET_GPR_U32(ctx, 31, 0x90000004u)");
+            t.IsTrue(opcode == OPCODE_JAL ? link != std::string::npos && link < delay : link == std::string::npos,
+                     "Only JAL sets the return address, before the delay slot reads it");
+        }
+    });
     tc.Run("Generated sources cannot be shadowed by stale local declaration headers", [](TestCase &t) {
         Function func;
         func.name = "header_lookup";
@@ -407,6 +536,12 @@ void register_code_generator_tests()
                  "coalesced D_PCR store should not remain as an individual Store32");
         t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000A000u") == std::string::npos,
                  "coalesced GIF CHCR store should not remain as an individual Store32");
+        gen.m_liveImmediateAddresses = {0x3004u};
+        const auto live = gen.generateFunction(func, instructions, false);
+        t.IsTrue(live.find("kickGifDmaChainFromMMIO") == std::string::npos,
+                 "Live immediates must disable DMA folding based on stale constants");
+        t.IsTrue(live.find("READ32(0x3004u)") != std::string::npos,
+                 "DMA address setup must read its live immediate");
     });
 
     tc.Run("GIF DMA kick coalesces when CHCR store is a return delay slot", [](TestCase &t) {
@@ -1528,6 +1663,26 @@ void register_code_generator_tests()
                      "the fallthrough must be restart-safe before a blocking HLE handler runs");
             t.IsTrue(generated.find("__entryPc") == std::string::npos,
                      "resolved HLE calls must not retain the unchanged-PC compatibility guard");
+        });
+
+        tc.Run("Forced guest functions bypass relocation syscall shortcuts", [](TestCase &t) {
+            Function func{};
+            func.name = "forced_guest_caller";
+            func.start = 0xA040;
+            func.end = 0xA048;
+            Symbol target{};
+            target.name = "GetThreadId";
+            target.address = 0xB040;
+            target.isFunction = true;
+            CodeGenerator gen({target}, {});
+            gen.m_recompileAddresses = {0xB040u};
+            gen.setRelocationCallNames({{0xA040u, "GetThreadId"}});
+            const std::string generated = gen.generateFunction(
+                func, {makeJal(0xA040, 0xB040), makeNop(0xA044)}, false);
+            t.IsTrue(generated.find("ps2_syscalls::GetThreadId(") == std::string::npos,
+                     "forced guest selection must also apply at resolved relocation callsites");
+            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, 0xB040u") != std::string::npos,
+                     "the call must use the selected guest body through runtime dispatch");
         });
 
         tc.Run("trailing JAL without decoded delay slot still emits call flow", [](TestCase &t) {

@@ -111,6 +111,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
+    m_gsIrqQueued = false;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
@@ -357,6 +358,11 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+
+    if (!m_gsIrqQueued && gsInterruptAsserted())
+    {
+        return true;
+    }
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -1254,11 +1260,17 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
+    queueIrq(dmac, cause);
+}
+
+bool EeScheduler::queueIrq(bool dmac, uint32_t cause,
+                            std::function<void(const R5900Context &, R5900Context &)> onComplete)
+{
     assertExecutor();
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
-        return;
+        return false;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
     std::vector<EeIrqHandler> matching;
@@ -1283,7 +1295,32 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 28, handler.gp);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
+        if (handler.id == matching.back().id)
+        {
+            invocation.onComplete = std::move(onComplete);
+        }
         queueInvocation(std::move(invocation));
+    }
+    return !matching.empty();
+}
+
+bool EeScheduler::gsInterruptAsserted() const noexcept
+{
+    const auto &gs = m_runtime.memory().gs();
+    // The implemented SIGNAL/FINISH status bits correspond to IMR bits 8/9
+    // (1 = masked). Other GS events do not yet have CSR acknowledgement support.
+    return (m_enabledIntcMask & 1u) != 0u &&
+           (gs.csr.load(std::memory_order_acquire) & ~(gs.imr >> 8u) & 0x3u) != 0u;
+}
+
+void EeScheduler::processGsInterrupt()
+{
+    if (!m_gsIrqQueued && gsInterruptAsserted())
+    {
+        // Keep one handler chain in flight. The guest acknowledges CSR; an
+        // event still asserted after the chain completes must remain eligible.
+        m_gsIrqQueued = queueIrq(false, 0u,
+            [this](const R5900Context &, R5900Context &) { m_gsIrqQueued = false; });
     }
 }
 
@@ -1762,6 +1799,7 @@ void EeScheduler::processPendingEvents()
     {
         processEvent(event);
     }
+    processGsInterrupt();
 
     {
         std::lock_guard lock(m_eventMutex);

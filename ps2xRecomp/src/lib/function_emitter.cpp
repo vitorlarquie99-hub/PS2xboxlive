@@ -178,7 +178,7 @@ namespace ps2recomp
                 }
                 else
                 {
-                    if (!gifDmaKickPlan.valid)
+                    if (!gifDmaKickPlan.valid && cg.m_liveImmediateAddresses.empty())
                     {
                         gifDmaKickPlan = tryBuildGifDmaKickPlan(instructions, i, constantRegisters, internalTargets);
                     }

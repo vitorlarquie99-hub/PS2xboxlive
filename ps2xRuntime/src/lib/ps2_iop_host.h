@@ -44,6 +44,8 @@ public:
     [[nodiscard]] CallScope enterCall(R5900Context *context,
                                       uint8_t *rdram = nullptr);
 
+    bool readControllerAxes(unsigned port, std::array<uint8_t, 4> &axes) override;
+    bool readControllerButtons(unsigned port, uint16_t &buttons) override;
     bool readGuest(uint32_t address, void *destination, size_t size) const override;
     bool writeGuest(uint32_t address, const void *source, size_t size) override;
     bool zeroGuest(uint32_t address, size_t size) override;

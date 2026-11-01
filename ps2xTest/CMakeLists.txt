@@ -8,6 +8,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(gs_cache)
+    add_executable(ps2_missing_capture_tests ../ps2xRuntime/tests/missing_capture_tests.cpp)
+    target_link_libraries(ps2_missing_capture_tests PRIVATE ps2_runtime)
+    add_test(NAME ps2_missing_capture_tests COMMAND ps2_missing_capture_tests)
 endif()
 
 # Static library with test logic (no main), used by ps2xStudio
@@ -19,6 +22,14 @@ target_include_directories(ps2_test_function_table PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
     ${CMAKE_SOURCE_DIR}/ps2xIOP/include
 )
+
+if(BUILD_TESTING)
+    add_executable(ps2_missing_capture_runtime_tests
+        ../ps2xRuntime/tests/missing_capture_runtime_tests.cpp
+        $<TARGET_OBJECTS:ps2_test_function_table>)
+    target_link_libraries(ps2_missing_capture_runtime_tests PRIVATE ps2_runtime)
+    add_test(NAME ps2_missing_capture_runtime_tests COMMAND ps2_missing_capture_runtime_tests)
+endif()
 
 add_library(ps2_test_lib STATIC
     src/code_generator_tests.cpp

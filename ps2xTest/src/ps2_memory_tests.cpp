@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ee_scheduler.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
@@ -2034,6 +2035,8 @@ void register_ps2_memory_tests()
             R5900Context ctx{};
             setRegU32(ctx, 4, 1u); // sceDmaGetChan(1) / VIF1
             setRegU32(ctx, 5, kTag);
+            // DMA completion enters the EE scheduler on its executor thread.
+            runtime.eeScheduler().reset(rdram, ctx);
             ps2_stubs::sceDmaSend(rdram, &ctx, &runtime);
 
             t.Equals(static_cast<int32_t>(::getRegU32(&ctx, 2)), 0,

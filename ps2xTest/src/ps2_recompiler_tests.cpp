@@ -1806,6 +1806,39 @@ void register_ps2_recompiler_tests()
                      "__sbprintf should be left for recompilation");
         });
 
+        tc.Run("guest addresses override automatic and explicit stub selection", [](TestCase &t) {
+            const auto root = std::filesystem::temp_directory_path() /
+                ("ps2recomp-guest-stub-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            std::filesystem::create_directories(root);
+            const auto elfPath = root / "guest.elf";
+            const auto configPath = root / "guest.toml";
+            for (const auto &name : {"sceFsInit", "ordinary_entry"})
+            {
+                t.IsTrue(writeMinimalMipsElfWithInitializer(elfPath, name, 0x00100000u),
+                         "Synthetic guest ELF must be written");
+                for (bool useGuest : {false, true})
+                {
+                    RecompilerConfig config{};
+                    config.inputPath = elfPath.string();
+                    config.outputPath = (root / "output").string();
+                    if (std::string(name) == "ordinary_entry")
+                        config.stubImplementations = {"ret0@0x00100000"};
+                    if (useGuest)
+                        config.recompileAddresses = {0x00100000u};
+                    ConfigManager(configPath.string()).saveConfig(config);
+                    PS2Recompiler recompiler(configPath.string());
+                    t.IsTrue(recompiler.initialize(), "Synthetic config must initialize");
+                    t.IsTrue(recompiler.recompile(), "Stub and guest variants must compile");
+                    t.Equals(recompiler.reportCounters().functionsStubbed, size_t(useGuest ? 0 : 1),
+                             "Opt-in must bypass both automatic names and explicit address bindings");
+                    t.Equals(recompiler.reportCounters().functionsRecompiled, size_t(useGuest ? 1 : 0),
+                             "The original body must be recompiled only when selected");
+                }
+            }
+            std::error_code error;
+            std::filesystem::remove_all(root, error);
+        });
+
         tc.Run("initializer skips fall back to guest recompilation", [](TestCase &t) {
             const std::string uniqueSuffix =
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());

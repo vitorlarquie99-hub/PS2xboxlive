@@ -34,6 +34,8 @@ namespace ps2x::iop::detail
         void reset() noexcept;
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
+        [[nodiscard]] bool dispatchDevctl(uint32_t command, uint32_t buffer, uint32_t bufferSize, int32_t &result);
+        [[nodiscard]] int32_t statLegacyFile(uint32_t nameAddress, uint32_t resultAddress);
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
 
     private:

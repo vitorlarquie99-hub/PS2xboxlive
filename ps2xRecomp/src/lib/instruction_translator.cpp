@@ -7,6 +7,7 @@
 #include "runtime/ps2_address.h"
 
 #include <fmt/format.h>
+#include <stdexcept>
 
 namespace ps2recomp
 {
@@ -69,8 +70,8 @@ namespace ps2recomp
 
     MemoryAccessHint InstructionTranslator::effectiveMemoryHintFor(const Instruction &inst, const MemoryAccessHint &memoryHint) const
     {
-        // TODO disable for now since it causing issues with some games.
-        return memoryHint;
+        // Live instruction immediates invalidate addresses inferred from the input ELF.
+        return m_codeGenerator.m_liveImmediateAddresses.empty() ? memoryHint : MemoryAccessHint{};
     }
 
     std::string InstructionTranslator::translateMemoryRead(const Instruction &inst,
@@ -122,6 +123,22 @@ namespace ps2recomp
 
     std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
+        if (m_codeGenerator.m_liveImmediateAddresses.contains(inst.address))
+        {
+            const std::string immediate = fmt::format("(READ32(0x{:X}u) & 0xffffu)", inst.address);
+            if (inst.opcode == OPCODE_LUI)
+                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)((uint32_t){} << 16));", inst.rt, immediate);
+            if (inst.opcode == OPCODE_ADDIU)
+                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ADD32(GPR_U32(ctx, {}), (int32_t)(int16_t){}));", inst.rt, inst.rs, immediate);
+            if (inst.opcode == OPCODE_LW)
+                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)READ32(ADD32(GPR_U32(ctx, {}), (int32_t)(int16_t){})));", inst.rt, inst.rs, immediate);
+            if (inst.opcode == OPCODE_SW)
+                return fmt::format("WRITE32(ADD32(GPR_U32(ctx, {}), (int32_t)(int16_t){}), GPR_U32(ctx, {}));", inst.rs, immediate, inst.rt);
+            if (inst.opcode == OPCODE_J || inst.opcode == OPCODE_JAL)
+                return "// Live J/JAL target is emitted with its delay slot";
+            throw std::runtime_error("unsupported live relocation instruction");
+        }
+
         if (inst.isMMI)
         {
             return m_codeGenerator.translateMMIInstruction(inst);

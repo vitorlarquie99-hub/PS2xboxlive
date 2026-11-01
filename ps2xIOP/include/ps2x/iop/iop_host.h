@@ -130,6 +130,19 @@ namespace ps2x::iop
             return false;
         }
 
+        // Optional native digital pad input, PS2 active-low button order.
+        virtual bool readControllerButtons(unsigned port, uint16_t &buttons)
+        {
+            (void)port;
+            buttons = 0xFFFFu;
+            return false;
+        }
+
+        virtual bool readControllerAxes(unsigned port, std::array<uint8_t, 4> &axes)
+        {
+            (void)port; axes.fill(0x80u); return false;
+        }
+
         virtual void log(LogLevel level, std::string_view message) = 0;
     };
 }

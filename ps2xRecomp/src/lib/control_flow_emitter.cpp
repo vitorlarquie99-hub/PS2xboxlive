@@ -279,6 +279,11 @@ namespace ps2recomp
 
     bool ControlFlowEmitter::emitRelocationCallIfAvailable(StaticBranchKind kind, std::string_view indent)
     {
+        const uint32_t target = buildAbsoluteJumpTarget(m_branchInst.address, m_branchInst.target);
+        if (m_gen.m_recompileAddresses.contains(target))
+        {
+            return false;
+        }
         const auto relocIt = m_gen.m_relocationCallNames.find(m_branchInst.address);
         if (relocIt == m_gen.m_relocationCallNames.end() || relocIt->second.empty())
         {
@@ -322,6 +327,26 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitStaticJump(StaticBranchKind kind)
     {
+        if (m_gen.m_liveImmediateAddresses.contains(branchPc()))
+        {
+            const bool isCall = kind == StaticBranchKind::Call;
+            m_ss << "    {\n";
+            // Capture the patched target before the delay slot can modify code.
+            // MIPS J/JAL retain the high nibble of PC+4, not the captured target.
+            m_ss << fmt::format("        const uint32_t jumpTarget = 0x{:X}u | ((READ32(0x{:X}u) & 0x03FFFFFFu) << 2);\n",
+                                (branchPc() + 4u) & 0xF0000000u, branchPc());
+            if (isCall)
+                m_ss << fmt::format("        SET_GPR_U32(ctx, 31, 0x{:X}u);\n", fallthroughPc());
+            emitDelaySlot("        ");
+            m_ss << "        ctx->pc = jumpTarget;\n";
+            emitRuntimeBranchDispatch("jumpTarget", branchPc(), isCall ? fallthroughPc() : 0u,
+                                      isCall ? "DirectCall" : "DirectJump",
+                                      isCall ? "JAL (live)" : "J (live)", "        ", true);
+            if (!isCall)
+                m_ss << "        return;\n";
+            m_ss << "    }\n";
+            return;
+        }
         if (kind == StaticBranchKind::Call)
         {
             m_ss << fmt::format("    SET_GPR_U32(ctx, 31, 0x{:X}u);\n", fallthroughPc());

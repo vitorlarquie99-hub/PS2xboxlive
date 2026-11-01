@@ -398,6 +398,7 @@ namespace ps2x::iop::detail
                 {
                     hasLoad = true;
                     minVaddr = std::min(minVaddr, program.vaddr);
+                    if (program.memsz > std::numeric_limits<uint32_t>::max() - program.vaddr) return result;
                     maxVaddr = std::max(maxVaddr, program.vaddr + program.memsz);
                 }
             }
@@ -415,6 +416,7 @@ namespace ps2x::iop::detail
                 if (!hasLoad && (section.flags & SHF_ALLOC) != 0u && section.size != 0u)
                 {
                     minVaddr = std::min(minVaddr, section.addr);
+                    if (section.size > std::numeric_limits<uint32_t>::max() - section.addr) return result;
                     maxVaddr = std::max(maxVaddr, section.addr + section.size);
                 }
             }
@@ -423,6 +425,7 @@ namespace ps2x::iop::detail
         if (minVaddr == std::numeric_limits<uint32_t>::max())
             minVaddr = 0u;
         uint32_t span = maxVaddr > minVaddr ? maxVaddr - minVaddr : 0x1000u;
+        if (span > IopMemory::HeapLimit - IopMemory::HeapBase) return result;
         span = alignUp(span, 0x100u);
         const bool relocate = header.type != ET_EXEC ||
                               maxVaddr > IopMemory::RamSize ||
@@ -432,18 +435,31 @@ namespace ps2x::iop::detail
         if (relocate)
         {
             base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            if (base > IopMemory::HeapLimit || span > IopMemory::HeapLimit - base)
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
             }
             delta = static_cast<int64_t>(base) - minVaddr;
-            result.nextModuleCursor = base + span;
         }
         else
         {
             base = minVaddr;
         }
+
+        if (!memory.reserveModule(base, span))
+        {
+            result.error = IopImageLoadError::ArenaExhausted;
+            return result;
+        }
+        bool keepReservation = false;
+        struct ReservationGuard
+        {
+            IopMemory &memory;
+            uint32_t base;
+            bool &keep;
+            ~ReservationGuard() { if (!keep) memory.releaseModule(base); }
+        } reservation{memory, base, keepReservation};
 
         if (hasLoad)
         {
@@ -455,7 +471,7 @@ namespace ps2x::iop::detail
                     program.memsz < program.filesz)
                     return result;
                 const uint32_t destination = static_cast<uint32_t>(static_cast<int64_t>(program.vaddr) + delta);
-                if (destination >= IopMemory::RamSize || program.memsz > IopMemory::RamSize - destination)
+                if (destination < base || destination > base + span || program.memsz > base + span - destination)
                     return result;
                 if (!memory.writeRam(destination, image.data() + program.offset, program.filesz))
                     return result;
@@ -482,7 +498,7 @@ namespace ps2x::iop::detail
                     section.addr = static_cast<uint32_t>(static_cast<int64_t>(destination) - delta);
                     sectionCursor += section.size;
                 }
-                if (destination >= IopMemory::RamSize || section.size > IopMemory::RamSize - destination)
+                if (destination < base || destination > base + span || section.size > base + span - destination)
                     return result;
                 if (section.type == SHT_NOBITS)
                 {
@@ -555,6 +571,8 @@ namespace ps2x::iop::detail
             }
         }
 
+        result.nextModuleCursor = std::max(moduleCursor, base + span);
+        keepReservation = true;
         result.error = IopImageLoadError::None;
         return result;
     }
