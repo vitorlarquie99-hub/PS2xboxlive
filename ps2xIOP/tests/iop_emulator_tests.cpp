@@ -664,6 +664,54 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
+    void writeSifDmaIntrIrx(TestHost &host, uint32_t address, bool invalidDestination)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t base = 0x10000u;
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = base; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = base; program.paddr = base;
+        program.filesz = 0x240u; program.memsz = 0x240u; program.flags = 7u; program.align = 4u;
+
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu,
+            jal(base + 0x144u), 0u, // disable interrupts
+            0x3C040001u, 0x34840180u, 0x24050001u,
+            0x3C060001u, 0x34C601D0u, 0x240704D2u,
+            0x3C1C1234u, 0x379C5678u, // callback GP
+            jal(base + 0x114u), 0u,
+            0x3C080001u, 0x350801B0u, 0xAD020004u, // save DMA ID
+            0x8D090000u, 0xAD090008u, // callback must not have run while disabled
+            jal(base + 0x14Cu), 0u, // enable interrupts
+            0x24020000u, 0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0u,
+        };
+        const uint32_t sifman[] = {0x41E00000u, 0u, 0x00000101u, 0x6D666973u, 0x00006E61u,
+                                   0x03E00008u, 0x24000020u, 0u, 0u};
+        const uint32_t intrman[] = {0x41E00000u, 0u, 0x00000101u, 0x72746E69u, 0x006E616Du,
+                                    0x03E00008u, 0x24000008u, 0x03E00008u, 0x24000009u, 0u, 0u};
+        const uint32_t descriptor[] = {base + 0x220u, invalidDestination ? 0x20000u : 0xC00u, 4u, 0u};
+        const uint32_t callback[] = {0x3C080001u, 0x350801B0u, 0xAD040000u, 0xAD1C000Cu,
+                                     0x8D090010u, 0x25290001u, 0xAD090010u, 0x03E00008u, 0u};
+        const uint32_t payload = 0x53494621u;
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x100u, sifman, sizeof(sifman));
+        std::memcpy(segment.data() + 0x130u, intrman, sizeof(intrman));
+        std::memcpy(segment.data() + 0x180u, descriptor, sizeof(descriptor));
+        std::memcpy(segment.data() + 0x1D0u, callback, sizeof(callback));
+        std::memcpy(segment.data() + 0x220u, &payload, sizeof(payload));
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
     void writeMcmanRegistrationIrx(TestHost &host, uint32_t address)
     {
         constexpr uint32_t codeOffset = 0x100u;
@@ -1080,6 +1128,33 @@ int main()
                 "sceSifDmaStat did not report the synchronous transfer as complete")) return 1;
     if (!expect(sifDmaPayload == 0x53494621u,
                 "IOP sceSifSetDma did not copy the payload into EE memory")) return 1;
+
+    for (bool invalidDestination : {false, true})
+    {
+        iop.reset();
+        std::memset(host.guest.data() + sifDmaDestination, 0, sizeof(uint32_t));
+        writeSifDmaIntrIrx(host, 0x100u, invalidDestination);
+        const ModuleLoadResult module = iop.loadModuleBuffer(0x100u);
+        iop.runEeCycles(4096u);
+        uint32_t markers[5]{};
+        if (!expect(module.handled && module.startResult == 0 &&
+                        iop.readMemory(0x101B0u, markers, sizeof(markers)),
+                    "sceSifSetDmaIntr test module failed")) return 1;
+        std::memcpy(&sifDmaPayload, host.guest.data() + sifDmaDestination, sizeof(sifDmaPayload));
+        if (!expect(markers[2] == 0u, "DMA callback ran while interrupts were disabled")) return 1;
+        if (invalidDestination)
+        {
+            if (!expect(markers[0] == 0u && markers[1] == 0u && markers[4] == 0u && sifDmaPayload == 0u,
+                        "Rejected interrupt DMA invoked a callback or wrote data")) return 1;
+        }
+        else if (!expect(markers[0] == 0x4D2u && markers[1] != 0u && markers[3] == 0x12345678u && markers[4] == 1u &&
+                             sifDmaPayload == 0x53494621u,
+                         "Interrupt DMA lost the payload, callback argument, GP, or ID")) return 1;
+        iop.runEeCycles(4096u);
+        if (!expect(iop.readMemory(0x101B0u, markers, sizeof(markers)) &&
+                        markers[4] == (invalidDestination ? 0u : 1u),
+                    "Interrupt DMA callback was repeated")) return 1;
+    }
 
     iop.reset();
     writeSio2InterruptIrx(host, 0x100u);

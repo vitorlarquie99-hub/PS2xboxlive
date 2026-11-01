@@ -38,7 +38,8 @@ namespace ps2x::iop::detail
             m_sifInitialized = true;
             setV0(0u);
             return true;
-        case 7: // sceSifSetDma
+        case 7:  // sceSifSetDma
+        case 32: // sceSifSetDmaIntr
         {
             constexpr uint32_t kDescriptorSize = 16u;
             constexpr uint32_t kMaxDescriptors = 32u;

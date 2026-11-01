@@ -3,6 +3,9 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+#include <limits>
+#include <vector>
+
 namespace ps2_stubs
 {
     namespace
@@ -539,7 +542,35 @@ namespace ps2_stubs
 
     void sceCdReadIOPm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        sceCdRead(rdram, ctx, runtime);
+        (void)rdram;
+        const uint32_t lbn = getRegU32(ctx, 4);
+        const uint32_t sectors = getRegU32(ctx, 5);
+        const uint32_t destination = getRegU32(ctx, 6);
+        const uint64_t byteCount = static_cast<uint64_t>(sectors) * kCdSectorSize;
+
+        // This command targets IOP RAM. An equal-numbered EE address can
+        // contain executable code and must never be used as a fallback.
+        if (!runtime || byteCount > std::numeric_limits<size_t>::max() ||
+            !runtime->isIopMemoryRange(destination, static_cast<size_t>(byteCount)))
+        {
+            g_lastCdError = -1;
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        std::vector<uint8_t> data(static_cast<size_t>(byteCount));
+        if (byteCount != 0u &&
+            (!readCdSectors(lbn, sectors, data.data(), data.size()) ||
+             !runtime->writeIopMemory(destination, data.data(), data.size())))
+        {
+            g_lastCdError = -1;
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        g_lastCdError = 0;
+        g_cdStreamingLbn = lbn + sectors;
+        setReturnS32(ctx, 1);
     }
 
     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

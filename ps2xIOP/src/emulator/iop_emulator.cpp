@@ -91,6 +91,7 @@ namespace ps2x::iop::detail
             uint32_t function = 0u;
             uint32_t gp = 0u;
             uint32_t argument = 0u;
+            bool requiresInterrupts = false;
         };
 
         explicit Impl(IopHost &hostRef)
@@ -324,9 +325,15 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
-                return rpc.dispatchSifManImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                const uint32_t callback = cpu.gpr[6];
+                const uint32_t argument = cpu.gpr[7];
+                const uint32_t gp = cpu.gpr[28];
+                if (!rpc.dispatchSifManImport(call.ordinal, cpu))
+                    return ImportDisposition::Missing;
+                if (call.ordinal == 32u && cpu.gpr[2] != 0u && callback != 0u)
+                    pendingGuestCallbacks.emplace(totalCycles + 1u,
+                                                  ScheduledGuestCallback{callback, gp, argument, true});
+                return ImportDisposition::Handled;
             }
             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
@@ -547,6 +554,11 @@ namespace ps2x::iop::detail
             {
                 if (it->first > totalCycles)
                     break;
+                if (it->second.requiresInterrupts && memory.interruptControl() == 0u)
+                {
+                    ++it;
+                    continue;
+                }
                 callbacks.push_back(it->second);
                 it = pendingGuestCallbacks.erase(it);
             }
@@ -558,6 +570,11 @@ namespace ps2x::iop::detail
             {
                 for (const ScheduledGuestCallback &callback : callbacks)
                 {
+                    if (callback.requiresInterrupts && memory.interruptControl() == 0u)
+                    {
+                        pendingGuestCallbacks.emplace(totalCycles, callback);
+                        continue;
+                    }
                     if (callback.function != 0u)
                     {
                         (void)callFunction(callback.function,
@@ -597,8 +614,12 @@ namespace ps2x::iop::detail
                         uint64_t nextWake = kernel.nextWakeCycle(target);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
-                        if (!pendingGuestCallbacks.empty())
-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                        for (const auto &[cycle, callback] : pendingGuestCallbacks)
+                            if (!callback.requiresInterrupts || memory.interruptControl() != 0u)
+                            {
+                                nextWake = std::min(nextWake, cycle);
+                                break;
+                            }
                         nextWake = timrman.nextEventCycle(nextWake);
                         if (memory.interruptControl() != 0u)
                             nextWake = vblank.nextEventCycle(nextWake);

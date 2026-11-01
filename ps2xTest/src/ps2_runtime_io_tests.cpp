@@ -10,6 +10,8 @@
 #include <vector>
 #include <cstring>
 #include <chrono>
+#include <algorithm>
+#include <array>
 
 using namespace ps2_syscalls;
 
@@ -705,6 +707,64 @@ void register_ps2_runtime_io_tests()
                      "sceCdSearchFile should report the host file size");
             t.IsTrue(readGuestU32(test.rdram.data(), fileAddr + 0) >= 0x00100000u,
                      "sceCdSearchFile should assign a pseudo LSN for the resolved host file");
+        });
+
+        tc.Run("sceCdReadIOPm isolates IOP transfers from EE memory", [](TestCase &t)
+        {
+            TestContext test;
+            constexpr uint32_t sectorSize = 2048u;
+            constexpr uint32_t destination = 0x001E0000u;
+            std::array<uint8_t, sectorSize> payload{};
+            for (size_t i = 0; i < payload.size(); ++i)
+                payload[i] = static_cast<uint8_t>(i * 17u + 3u);
+            const auto imagePath = test.paths.base / "iop-read.iso";
+            {
+                std::ofstream out(imagePath, std::ios::binary);
+                std::array<uint8_t, sectorSize> firstSector{};
+                out.write(reinterpret_cast<const char *>(firstSector.data()), firstSector.size());
+                out.write(reinterpret_cast<const char *>(payload.data()), payload.size());
+            }
+            auto paths = PS2Runtime::getIoPaths();
+            paths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(paths);
+
+            std::fill(test.rdram.begin(), test.rdram.end(), 0xA5u);
+            std::array<uint8_t, sectorSize + 32u> guarded{};
+            guarded.fill(0x5Au);
+            t.IsTrue(test.runtime.writeIopMemory(destination - 16u, guarded.data(), guarded.size()),
+                     "IOP transfer fixture should fit in IOP RAM");
+            setRegU32(test.ctx, 4, 1u);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, destination);
+            ps2_stubs::sceCdReadIOPm(test.rdram.data(), &test.ctx, &test.runtime);
+            t.Equals(getRegS32(&test.ctx, 2), 1, "IOP sector read should succeed");
+            std::array<uint8_t, sectorSize + 32u> actual{};
+            t.IsTrue(test.runtime.readIopMemory(destination - 16u, actual.data(), actual.size()),
+                     "IOP transfer result should be readable");
+            std::copy(payload.begin(), payload.end(), guarded.begin() + 16u);
+            t.IsTrue(actual == guarded, "Only the requested IOP sector should change");
+
+            for (const auto &[address, count] : std::array<std::pair<uint32_t, uint32_t>, 3>{
+                     std::pair{0x001FFFF0u, 1u}, {0x00200000u, 1u}, {destination, 0xFFFFFFFFu}})
+            {
+                setRegU32(test.ctx, 5, count);
+                setRegU32(test.ctx, 6, address);
+                ps2_stubs::sceCdReadIOPm(test.rdram.data(), &test.ctx, &test.runtime);
+                t.Equals(getRegS32(&test.ctx, 2), 0, "Out-of-range IOP transfers should fail");
+            }
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, destination);
+            ps2_stubs::sceCdReadIOPm(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), 0, "Missing IOP runtime should fail");
+
+            paths.cdImage = test.paths.base / "missing.iso";
+            PS2Runtime::setIoPaths(paths);
+            ps2_stubs::sceCdReadIOPm(test.rdram.data(), &test.ctx, &test.runtime);
+            t.Equals(getRegS32(&test.ctx, 2), 0, "Unavailable source should fail");
+            t.IsTrue(test.runtime.readIopMemory(destination - 16u, actual.data(), actual.size()) && actual == guarded,
+                     "Rejected transfers should preserve the existing IOP data");
+            t.IsTrue(std::all_of(test.rdram.begin(), test.rdram.end(), [](uint8_t byte) { return byte == 0xA5u; }),
+                     "Successful and rejected IOP reads must preserve all EE memory");
         });
 
         tc.Run("sceCdRead reads from explicit cdImage path", [](TestCase &t)
